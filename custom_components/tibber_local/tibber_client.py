@@ -772,10 +772,12 @@ class TibberLocalBridge:
 
                 # Wait up to 10 seconds for the next message from the websocket
                 msg = await asyncio.wait_for(ws.receive(timeout=10.0), timeout=10.5)
-                if msg.type in [aiohttp.WSMsgType.BINARY, aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR]:
+                if msg.type in [aiohttp.WSMsgType.BINARY, aiohttp.WSMsgType.TEXT]:
                     _LOGGER.debug(f"ws_check_implementation(): received: {msg} - all COOL - use real WebSocket implementation")
                     could_read_message_with_aiohttp = True
 
+        except asyncio.CancelledError:
+            raise
         except asyncio.TimeoutError as timeout:
             _LOGGER.info(f"ws_check_implementation(): Timeout! No message from ws via aiohttp in 10 sec :-/")
         except BaseException as x:
