@@ -228,9 +228,38 @@ def test_authentication_header_retains_existing_ascii_credentials(client):
     assert b.REQ_HEADERS_BASIC_AUTH == {"Authorization": "Basic " + base64.b64encode(b"admin:test-password").decode()}
 
 
+@pytest.mark.parametrize("status,body,classic", [
+    (200, '{"esp32_fw_v":"1793-old"}', True),
+    (200, '{"esp32_fw_v":"1794-03b6cbaf"}', False),
+    (200, '{"esp32_fw_v":"1811-current"}', False),
+    (200, 'prefix {"esp32_fw_v":"1811"} suffix', False),
+    (200, '{}', True),
+    (200, '{"esp32_fw_v":null}', True),
+    (200, '{"esp32_fw_v":"unknown"}', True),
+    (200, '{"esp32_fw_v":1811}', True),
+    (200, 'invalid response', True),
+    (404, '{"esp32_fw_v":"1811-current"}', True),
+])
+def test_firmware_response_selects_matching_endpoints(client, status, body, classic):
+    response = SimpleNamespace(status=status, text=AsyncMock(return_value=body))
+    context = AsyncMock()
+    context.__aenter__.return_value = response
+    session = SimpleNamespace(get=Mock(return_value=context))
+    b = bridge(client, session)
+    asyncio.run(b.check_and_apply_fw_version())
+    prefix = "" if classic else "node_"
+    assert b.use_classic is classic
+    assert b.url_data == f"http://bridge.test/{prefix}data.json?node_id=1"
+    assert b.url_metrics == f"http://bridge.test/{prefix}metrics.json?node_id=1"
+    session.get.assert_called_once_with(
+        "http://bridge.test/test.json", headers=b.REQ_HEADERS_BASIC_AUTH,
+        ssl=False, timeout=10.0,
+    )
+
+
 def test_release_metadata_and_source_syntax():
     manifest = json.loads((SOURCE / "manifest.json").read_text())
-    assert manifest["version"] == "2026.10.2.1"
+    assert manifest["version"] == "2026.10.3"
     assert manifest["domain"] == "tibber_local"
     assert manifest["requirements"] == ["smllib>=1.7"]
     for path in SOURCE.rglob("*.py"):
