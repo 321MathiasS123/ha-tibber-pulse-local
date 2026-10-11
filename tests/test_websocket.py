@@ -259,7 +259,7 @@ def test_firmware_response_selects_matching_endpoints(client, status, body, clas
 
 def test_release_metadata_and_source_syntax():
     manifest = json.loads((SOURCE / "manifest.json").read_text())
-    assert manifest["version"] == "2026.10.3"
+    assert manifest["version"] == "2026.10.3.1"
     assert manifest["domain"] == "tibber_local"
     assert manifest["requirements"] == ["smllib>=1.7"]
     for path in SOURCE.rglob("*.py"):
