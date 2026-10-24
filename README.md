@@ -1,8 +1,10 @@
-# Tibber Pulse IR LOCAL
+# <sub><img src="https://raw.githubusercontent.com/marq24/ha-tibber-pulse-local/main/custom_components/tibber_local/brand/icon48.png" style="align:bottom;"></sub> Tibber Pulse IR LOCAL 
 
 If you like to access the data of your Tibber Pulse IR directly (instead of the detour through the cloud), then there is a simple approach to read the data directly from the Tibber Pulse Bridge. There are alternative solutions via an additional MQTT - but why should the data go through such a proxy if it can be read directly.
 
 This integration will work __only__ with the __IR__ Version of the Tibber Pulse. There are other versions: P1, HAN or KM (sold in countries like Sweden, Norway or the Netherlands) that __are not compatible__ with this integration. If you are not sure what Tibber Pulse version you have, just check if you have an additional 'Bridge' device – which is basically an additional thing that you have to plug into a power outlet (see the picture below).
+
+For Tibber Pulse P1, HAN or KM you might like to check out, if the [ha-tibber-pulse-mqtt by mrhedstrom](https://github.com/mrhedstrom/ha-tibber-pulse-mqtt) will satisfy your needs.
 
 __Please note__, _that this integration is not official and not supported by the tibber development team. I am not affiliated with tibber in any way._
 
@@ -29,6 +31,7 @@ Please consider [using my personal Tibber invitation link to join Tibber today](
    - SML 1.04
    - Plaintext
    - IEC-62056.21
+   - Logarex
    - Impressions (Blinks / kwh) using ambient
 
   The Tibber Bridge additionally offers the modes: _AutoScanMode, IEC-62056.21, Logarex and Impressions (Blinks / kwh) using IR sensors_. To support these other modes, I would need sample data from you. If your Tibber Pulse IR using one of these communications protocols, please be so kind and create here an issue in github - TIA!
