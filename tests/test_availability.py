@@ -208,7 +208,7 @@ def test_cancellation_is_not_hidden_by_fresh_data(client, clock, update_method, 
 
 @pytest.mark.parametrize("stage", ["headers", "body"])
 @pytest.mark.parametrize("stale", [False, True])
-def test_old_success_cannot_replace_newer_reading_or_hide_staleness(client, clock, update_method, stage, stale):
+def test_successful_http_after_intervening_websocket_data_remains_available(client, clock, update_method, stage, stale):
     async def scenario():
         response = PendingHTTP(payload=PLAINTEXT, stage=stage)
         b = make_bridge(client, response)
@@ -219,14 +219,10 @@ def test_old_success_cannot_replace_newer_reading_or_hide_staleness(client, cloc
         await publish(b)
         clock.now = 105 if stale else 101.05
         response.release.set()
-        if stale:
-            with pytest.raises(UpdateFailed):
-                await task
-        else:
-            result = await task
-            assert result[client.OBIS_DATA_KEY] is b._obis_values
-        assert value(b) == 52
-        assert b._last_meter_data_update == 101
+        result = await task
+        assert result[client.OBIS_DATA_KEY] is b._obis_values
+        assert value(b) == 42
+        assert b._last_meter_data_update == clock.now
     asyncio.run(scenario())
 
 

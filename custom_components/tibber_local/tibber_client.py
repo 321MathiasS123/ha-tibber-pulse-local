@@ -398,30 +398,19 @@ class TibberLocalBridge:
         _LOGGER.debug(f"read_tibber_local(): start[{retry_count}] - mode: {mode} request: {self.url_data}")
         # on init we wait up to 60 seconds till we get a reply from the bridge (when HA is starting, plenty of
         # requests are running...
-        request_started = time.monotonic()
         async with self.web_session.get(self.url_data, headers=self.REQ_HEADERS_BASIC_AUTH, ssl=False, timeout=60.0 if len(self._obis_values) == 0 else 10.0) as res:
             try:
                 res.raise_for_status()
                 if res.status == 200:
                     if mode == MODE_3_SML_1_04:
-                        payload = await res.read()
+                        await self.mode_03_read_sml(await res.read(), retry_count, log_payload)
 
                     elif mode == MODE_10_ImpressionsAmbient:
-                        payload = await res.json()
+                        await self.mode_10_read_json_impressions_ambient(await res.json(), retry_count, log_payload)
 
                     elif mode == MODE_99_PLAINTEXT:
-                        payload = await res.text(errors="ignore")
-
-                    # A request started before a newer meter reading must not overwrite it.
-                    if self._last_meter_data_update > request_started:
-                        raise ClientConnectionError("HTTP response superseded by newer meter data")
-
-                    if mode == MODE_3_SML_1_04:
-                        await self.mode_03_read_sml(payload, retry_count, log_payload)
-                    elif mode == MODE_10_ImpressionsAmbient:
-                        await self.mode_10_read_json_impressions_ambient(payload, retry_count, log_payload)
-                    elif mode == MODE_99_PLAINTEXT:
-                        await self.mode_99_read_plaintext(payload, retry_count, log_payload)
+                        plaintext_payload = await res.text(errors="ignore")
+                        await self.mode_99_read_plaintext(plaintext_payload, retry_count, log_payload)
 
                     if _LOGGER.isEnabledFor(logging.DEBUG):
                         _LOGGER.debug(f"read_tibber_local: after[{retry_count}] read - found OBIS entries: '{gen_log_list(self._obis_values)}'")
