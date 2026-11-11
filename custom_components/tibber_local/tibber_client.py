@@ -217,6 +217,7 @@ class TibberLocalBridge:
         self._LAST_METRICS_UPDATE = 0
         self._metrics_data = {}
         self._obis_values = {}
+        self._last_meter_data_update = 0
         #self._obis_values_by_short = {}
 
         self._fallback_usage_counter = 0
@@ -397,19 +398,30 @@ class TibberLocalBridge:
         _LOGGER.debug(f"read_tibber_local(): start[{retry_count}] - mode: {mode} request: {self.url_data}")
         # on init we wait up to 60 seconds till we get a reply from the bridge (when HA is starting, plenty of
         # requests are running...
+        request_started = time.monotonic()
         async with self.web_session.get(self.url_data, headers=self.REQ_HEADERS_BASIC_AUTH, ssl=False, timeout=60.0 if len(self._obis_values) == 0 else 10.0) as res:
             try:
                 res.raise_for_status()
                 if res.status == 200:
                     if mode == MODE_3_SML_1_04:
-                        await self.mode_03_read_sml(await res.read(), retry_count, log_payload)
+                        payload = await res.read()
 
                     elif mode == MODE_10_ImpressionsAmbient:
-                        await self.mode_10_read_json_impressions_ambient(await res.json(), retry_count, log_payload)
+                        payload = await res.json()
 
                     elif mode == MODE_99_PLAINTEXT:
-                        plaintext_payload = await res.text(errors="ignore")
-                        await self.mode_99_read_plaintext(plaintext_payload, retry_count, log_payload)
+                        payload = await res.text(errors="ignore")
+
+                    # A request started before a newer meter reading must not overwrite it.
+                    if self._last_meter_data_update > request_started:
+                        raise ClientConnectionError("HTTP response superseded by newer meter data")
+
+                    if mode == MODE_3_SML_1_04:
+                        await self.mode_03_read_sml(payload, retry_count, log_payload)
+                    elif mode == MODE_10_ImpressionsAmbient:
+                        await self.mode_10_read_json_impressions_ambient(payload, retry_count, log_payload)
+                    elif mode == MODE_99_PLAINTEXT:
+                        await self.mode_99_read_plaintext(payload, retry_count, log_payload)
 
                     if _LOGGER.isEnabledFor(logging.DEBUG):
                         _LOGGER.debug(f"read_tibber_local: after[{retry_count}] read - found OBIS entries: '{gen_log_list(self._obis_values)}'")
@@ -419,6 +431,8 @@ class TibberLocalBridge:
                     else:
                         _LOGGER.warning(f"access to bridge failed (UNKNOWN reason - 'res' is None)")
 
+            except (CancelledError, aiohttp.ClientError, asyncio.TimeoutError):
+                raise
             except BaseException as exc:
                 _LOGGER.warning(f"access to bridge failed with exception: {type(exc).__name__} - {exc}")
 
@@ -506,6 +520,7 @@ class TibberLocalBridge:
                 for entry in temp_obis_values:
                     self._obis_values[entry.obis] = entry
                     #self._obis_values_by_short[entry.obis.obis_short] = entry
+                self._last_meter_data_update = time.monotonic()
 
         except Exception as exc:
             if not self.ignore_parse_errors:
@@ -545,6 +560,7 @@ class TibberLocalBridge:
 
         if len(temp_obis_values) > 0:
             self._obis_values = temp_obis_values
+            self._last_meter_data_update = time.monotonic()
 
     async def mode_03_read_sml(self, payload: bytes, retry_count: int, log_payload: bool):
         # for whatever reason, the data that can be read from the TibberPulse Webserver is
@@ -602,6 +618,7 @@ class TibberLocalBridge:
                     for entry in sml_list:
                         self._obis_values[entry.obis] = entry
                         #self._obis_values_by_short[entry.obis.obis_short] = entry
+                    self._last_meter_data_update = time.monotonic()
 
         except (CrcError, BaseException) as exc:
             if not self.ignore_parse_errors:
@@ -712,6 +729,7 @@ class TibberLocalBridge:
         )
 
     async def _ws_dispatch_payload(self, source_type: aiohttp.WSMsgType, topic: str | None, body: bytes | str, raw_payload: bytes | str) -> bool:
+        previous_values = self._obis_values
         if topic is None:
             _LOGGER.warning(f"_ws_dispatch_payload(): {source_type.name} topic '{topic}'/mode_'{self._com_mode}' in: {raw_payload}")
             return False
@@ -726,7 +744,7 @@ class TibberLocalBridge:
             _LOGGER.debug(f"_ws_dispatch_payload(): {source_type.name} body '{topic}' [len:{len(binary_body)}]: {binary_body if len(binary_body) <= 15 else binary_body[:15]}...")
             try:
                 await self.mode_03_read_sml(binary_body, retry_count=self.MAX_READ_RETRIES, log_payload=False)
-                return True
+                return self._obis_values is not previous_values
             except Exception as e:
                 _LOGGER.warning(f"_ws_dispatch_payload(): {source_type.name} 'mode_03_read_sml' caused {type(e).__name__} [{binary_body}] {e}")
                 return False
@@ -738,7 +756,7 @@ class TibberLocalBridge:
 
             try:
                 await self.mode_99_read_plaintext(text_body, retry_count=self.MAX_READ_RETRIES, log_payload=False)
-                return True
+                return self._obis_values is not previous_values
             except Exception as e:
                 _LOGGER.warning(f"_ws_dispatch_payload(): {source_type.name} 'mode_99_read_plaintext' caused {type(e).__name__} [{text_body}] {e}")
                 return False
@@ -748,7 +766,7 @@ class TibberLocalBridge:
             _LOGGER.debug(f"_ws_dispatch_payload(): {source_type.name} body (as JSON) '{topic}' [len:{len(json_body)}]: {json_body if len(json_body) <= 15 else json_body[:15]}...")
             try:
                 await self.mode_10_read_json_impressions_ambient(json.loads(json_body), retry_count=self.MAX_READ_RETRIES, log_payload=False)
-                return True
+                return self._obis_values is not previous_values
             except Exception as e:
                 _LOGGER.warning(f"_ws_dispatch_payload(): {source_type.name} 'mode_10_read_json_impressions_ambient' caused {type(e).__name__} [{json_body}] {e}")
                 return False

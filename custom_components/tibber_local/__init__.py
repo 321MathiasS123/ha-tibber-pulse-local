@@ -4,8 +4,6 @@ from datetime import timedelta
 from numbers import Number
 from typing import Final, Any
 
-import voluptuous as vol
-from aiohttp import ClientConnectionError
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     CONF_ID,
@@ -64,7 +62,6 @@ from .entity import CustomFriendlyNameEntity
 from .tibber_client import TibberLocalBridge
 
 _LOGGER = logging.getLogger(__name__)
-CONFIG_SCHEMA = vol.Schema({DOMAIN: vol.Schema({})}, extra=vol.ALLOW_EXTRA)
 
 PLATFORMS: Final = [Platform.SENSOR]
 WEBSOCKET_WATCHDOG_INTERVAL: Final = timedelta(seconds=64)
@@ -200,6 +197,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
                 hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, coordinator.start_watchdog)
 
         config_entry.async_on_unload(config_entry.add_update_listener(entry_update_listener))
+        _LOGGER.info(f"async_setup_entry(): integration setup complete for {config_entry.entry_id}")
         return True
 
 async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry):
@@ -420,9 +418,11 @@ class TibberLocalDataUpdateCoordinator(DataUpdateCoordinator):
             return len(bridge_data.keys()) > 0
 
     async def _async_update_data(self):
+        update_started = time.monotonic()
         try:
             if not self._use_classic:
-                if self.bridge._ws_LAST_NEW_DATA_NOTIFY + self._integration_update_interval_in_seconds < time.time():
+                if (not self._use_websocket_in_config
+                        or self.bridge._last_meter_data_update + self._integration_update_interval_in_seconds < time.monotonic()):
                     # right now with new FW the websocket is not deliver any data - must check later how to solve this...
                     _LOGGER.debug(f"_async_update_data(): called - new FW active websocket does not provide any data")
                     await self.bridge.update()
@@ -454,13 +454,15 @@ class TibberLocalDataUpdateCoordinator(DataUpdateCoordinator):
                 METRICS_KEY: self.bridge._metrics_data,
             }
 
-        except UpdateFailed as exception:
-            _LOGGER.warning(f"_async_update_data(): UpdateFailed: {type(exception).__name__} - {exception}")
-            raise UpdateFailed() from exception
-        except ClientConnectionError as exception:
-            _LOGGER.warning(f"_async_update_data(): UpdateFailed cause of ClientConnectionError: {type(exception).__name__} - {exception}")
-            raise UpdateFailed() from exception
         except Exception as other:
+            last_meter_update = self.bridge._last_meter_data_update
+            if (self.bridge._obis_values and last_meter_update >= update_started
+                    and time.monotonic() - last_meter_update <= self._integration_update_interval_in_seconds):
+                _LOGGER.debug("_async_update_data(): ignoring obsolete HTTP failure after a fresh meter reading", exc_info=True)
+                return {
+                    OBIS_DATA_KEY: self.bridge._obis_values,
+                    METRICS_KEY: self.bridge._metrics_data,
+                }
             _LOGGER.warning(f"_async_update_data(): UpdateFailed unexpected: {type(other).__name__} - {other}")
             raise UpdateFailed() from other
 
