@@ -64,7 +64,7 @@ from .tibber_client import TibberLocalBridge
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: Final = [Platform.SENSOR]
-WEBSOCKET_WATCHDOG_INTERVAL: Final = timedelta(seconds=64)
+WEBSOCKET_WATCHDOG_INTERVAL: Final = timedelta(seconds=10)
 MASKED_KEYS: Final = ("host", "password")
 
 def mask_map(d: dict) -> dict:
@@ -344,8 +344,6 @@ class TibberLocalDataUpdateCoordinator(DataUpdateCoordinator):
             except BaseException as ex:
                 _LOGGER.info(f"_check_for_ws_task_and_cancel_if_running(): Watchdog: websocket connect task cancel failed: {type(ex).__name__} - {ex}")
 
-            self._a_task = None
-
     async def _async_watchdog_check(self, *_):
         """Reconnect the websocket if it fails."""
         if not self.bridge.ws_supported:
@@ -353,7 +351,8 @@ class TibberLocalDataUpdateCoordinator(DataUpdateCoordinator):
             self.stop_watchdog()
         else:
             if not self.bridge.ws_connected:
-                self._check_for_ws_task_and_cancel_if_running()
+                if self._a_task is not None and not self._a_task.done():
+                    return
                 _LOGGER.info(f"_async_watchdog_check(): Watchdog: websocket connect required")
                 self._a_task = self._config_entry.async_create_background_task(self.hass, self.bridge.ws_connect(), "ws_connection")
                 if self._a_task is not None:

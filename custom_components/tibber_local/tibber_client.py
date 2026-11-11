@@ -646,8 +646,12 @@ class TibberLocalBridge:
                     self._metrics_data = await res.json()
                     if log_payload:
                         _LOGGER.debug(f"updated_tibber_metrics_if_needed(): metrics response: {self._metrics_data}")
+                except CancelledError:
+                    raise
                 except BaseException as exc:
                     _LOGGER.warning(f"updated_tibber_metrics_if_needed(): failed to parse metrics JSON: {type(exc).__name__} - {exc}")
+        except CancelledError:
+            raise
         except BaseException as exc:
             _LOGGER.warning(f"updated_tibber_metrics_if_needed(): access to bridge failed with exception: {type(exc).__name__} - {exc}")
 
@@ -786,14 +790,15 @@ class TibberLocalBridge:
     async def ws_check_implementation(self):
         could_read_message_with_aiohttp = False
         try:
-            async with self.web_session.ws_connect(self.url_ws, headers=self.REQ_HEADERS_BASIC_AUTH, compress=0) as ws:
-                _LOGGER.info(f"ws_check_implementation(): test aiohttp websocket with: {self.url_ws} (waiting max of 10 sec)")
+            async with asyncio.timeout(12):
+                async with self.web_session.ws_connect(self.url_ws, headers=self.REQ_HEADERS_BASIC_AUTH, compress=0) as ws:
+                    _LOGGER.info(f"ws_check_implementation(): test aiohttp websocket with: {self.url_ws} (waiting max of 10 sec)")
 
-                # Wait up to 10 seconds for the next message from the websocket
-                msg = await asyncio.wait_for(ws.receive(timeout=10.0), timeout=10.5)
-                if msg.type in [aiohttp.WSMsgType.BINARY, aiohttp.WSMsgType.TEXT]:
-                    _LOGGER.debug(f"ws_check_implementation(): received: {msg} - all COOL - use real WebSocket implementation")
-                    could_read_message_with_aiohttp = True
+                    # Wait up to 10 seconds for the next message from the websocket
+                    msg = await asyncio.wait_for(ws.receive(timeout=10.0), timeout=10.5)
+                    if msg.type in [aiohttp.WSMsgType.BINARY, aiohttp.WSMsgType.TEXT]:
+                        _LOGGER.debug(f"ws_check_implementation(): received: {msg} - all COOL - use real WebSocket implementation")
+                        could_read_message_with_aiohttp = True
 
         except asyncio.CancelledError:
             raise
@@ -805,6 +810,8 @@ class TibberLocalBridge:
         finally:
             try:
                 await self.ws_close(ws)
+            except CancelledError:
+                raise
             except BaseException:
                 #ignore any closing errors of our test...
                 pass
@@ -877,38 +884,40 @@ class TibberLocalBridge:
     async def ws_connect_2026_09(self):
         # We can't use a standard websocket lib here, since the Pulse sends always two bytes
         # b'\x02%' that can't be ready with aiohttp :-/
-        self.ws_reader, self.ws_writer = await asyncio.open_connection(self.url_ws_host, 80)
-
-        request = (
-            f"GET /ws HTTP/1.1\r\n"
-            f"Host: {self.url_ws_host}\r\n"
-            f"Authorization: {self.basic_auth_for_header}\r\n"
-            "\r\n"
-        )
-        self.ws_writer.write(request.encode("utf-8"))
-        await self.ws_writer.drain()
-
-        # # Consume HTTP handshake until double CRLF (prevents frame offset errors)
-        # try:
-        #     handshake = await self.ws_reader.readuntil(b"\r\n\r\n")
-        #     _LOGGER.debug(f"Handshake response received:\n{handshake.decode(errors='ignore')}")
-        # except (asyncio.IncompleteReadError, asyncio.LimitOverrunError) as err:
-        #     _LOGGER.error(f"Failed to complete WS handshake: {err}")
-        #     return
-
-        self.ws_connected = True
-        _LOGGER.debug(f"ws_connect_2026_09(): connected to websocket: {self.url_ws} in COM MODE: {self._com_mode}")
-
-        # our data container
-        message_buffer = bytearray()
-
+        reader = writer = None
         try:
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(self.url_ws_host, 80), 10)
+            self.ws_reader, self.ws_writer = reader, writer
+
+            request = (
+                f"GET /ws HTTP/1.1\r\n"
+                f"Host: {self.url_ws_host}\r\n"
+                f"Authorization: {self.basic_auth_for_header}\r\n"
+                "\r\n"
+            )
+            writer.write(request.encode("utf-8"))
+            await writer.drain()
+
+            # # Consume HTTP handshake until double CRLF (prevents frame offset errors)
+            # try:
+            #     handshake = await reader.readuntil(b"\r\n\r\n")
+            #     _LOGGER.debug(f"Handshake response received:\n{handshake.decode(errors='ignore')}")
+            # except (asyncio.IncompleteReadError, asyncio.LimitOverrunError) as err:
+            #     _LOGGER.error(f"Failed to complete WS handshake: {err}")
+            #     return
+
+            self.ws_connected = True
+            _LOGGER.debug(f"ws_connect_2026_09(): connected to websocket: {self.url_ws} in COM MODE: {self._com_mode}")
+
+            # our data container
+            message_buffer = bytearray()
+
             # Framing Loop using exact byte reading
             # https://www.rfc-editor.org/rfc/rfc6455.html#section-5.2
             # once again thanks @arrizer for your patience explaining a NOOB how all this is working!
             while True:
                 # Read exactly the 2-byte WebSocket frame header
-                header = await self.ws_reader.readexactly(2)
+                header = await reader.readexactly(2)
                 byte1, byte2 = header[0], header[1]
 
                 is_fin = bool(byte1 & 0x80)
@@ -922,14 +931,14 @@ class TibberLocalBridge:
                     if payload_len == 127:
                         # RFC specifies an 8-byte (64-bit) length field for 127
                         bytes_to_read = 8
-                    ext_bytes = await self.ws_reader.readexactly(bytes_to_read)
+                    ext_bytes = await reader.readexactly(bytes_to_read)
                     payload_len = int.from_bytes(ext_bytes, byteorder="big")
 
                 # Read masking key if present
-                mask_key = await self.ws_reader.readexactly(4) if is_masked else None
+                mask_key = await reader.readexactly(4) if is_masked else None
 
                 # Read the frame payload
-                payload = await self.ws_reader.readexactly(payload_len) if payload_len > 0 else b""
+                payload = await reader.readexactly(payload_len) if payload_len > 0 else b""
                 #_LOGGER.debug(f"ws_connect_2026_09(): read {payload_len} bytes for frame {payload}")
 
                 # Unmask payload if server set the mask bit
@@ -942,8 +951,8 @@ class TibberLocalBridge:
                     break
                 elif opcode == 0x9:  # Ping -> Respond with Pong (0xA)
                     pong_frame = bytes([0x8A, len(payload)]) + payload
-                    self.ws_writer.write(pong_frame)
-                    await self.ws_writer.drain()
+                    writer.write(pong_frame)
+                    await writer.drain()
                     continue
                 elif opcode == 0xA:  # Pong
                     continue
@@ -959,15 +968,20 @@ class TibberLocalBridge:
             _LOGGER.info("ws_connect_2026_09(): WebSocket connection closed cleanly by remote host.")
         except asyncio.CancelledError:
             _LOGGER.debug("ws_connect_2026_09(): WebSocket reader task cancelled.")
+            raise
         except Exception as ex:
             _LOGGER.warning(f"ws_connect_2026_09(): Error parsing WebSocket stream: {type(ex).__name__}: {ex}")
         finally:
-            self.ws_connected = False
-            if self.ws_writer:
-                self.ws_writer.close()
-                await self.ws_writer.wait_closed()
+            if self.ws_writer is writer:
+                self.ws_connected = False
                 self.ws_writer = None
                 self.ws_reader = None
+            if writer is not None:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except OSError:
+                    pass
 
     async def handle_buffer(self, buffer):
         self._ws_LAST_UPDATE = time.time()
@@ -1016,6 +1030,8 @@ class TibberLocalBridge:
             try:
                 await ws.close()
                 _LOGGER.debug(f"ws_close(): connection closed successfully")
+            except CancelledError:
+                raise
             except BaseException as e:
                 _LOGGER.info(f"ws_close(): Error closing WebSocket connection: {type(e).__name__} - {e}")
             finally:
