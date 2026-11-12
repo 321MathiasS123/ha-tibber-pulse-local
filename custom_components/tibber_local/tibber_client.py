@@ -207,6 +207,7 @@ class TibberLocalBridge:
         self.ws_writer = None
         self._ws_LAST_UPDATE = 0
         self._ws_debounced_update_task: asyncio.Task | None = None
+        self._ws_metrics_task: asyncio.Task | None = None
         self._ws_LAST_NEW_DATA_NOTIFY = 0
 
         self._com_mode = com_mode
@@ -784,6 +785,8 @@ class TibberLocalBridge:
             _LOGGER.info(f"ws_connect(): will start the classic websocket implementation")
             await self.ws_connect_classic()
         else:
+            if not self.ws_supported:
+                return
             _LOGGER.info(f"ws_connect(): will start the self implemented websocket (plain reader/writer)")
             await self.ws_connect_2026_09()
 
@@ -804,6 +807,11 @@ class TibberLocalBridge:
             raise
         except asyncio.TimeoutError as timeout:
             _LOGGER.info(f"ws_check_implementation(): Timeout! No message from ws via aiohttp in 10 sec :-/")
+        except ClientResponseError as ex:
+            if ex.status == 404:
+                self.ws_supported = False
+            else:
+                _LOGGER.error(f"ws_check_implementation(): Exception {type(ex).__name__} - {ex}")
         except BaseException as x:
             _LOGGER.error(f"ws_check_implementation(): Exception {type(x).__name__} - {x}")
 
@@ -823,6 +831,7 @@ class TibberLocalBridge:
         try:
             async with self.web_session.ws_connect(self.url_ws, headers=self.REQ_HEADERS_BASIC_AUTH, compress=0) as ws:
                 self.ws_connected = True
+                self._ws_LAST_UPDATE = time.time()
                 self.ws_obj = ws
                 _LOGGER.info(f"ws_connect_classic(): connected to websocket: {self.url_ws} - in COM MODE: {self._com_mode}")
                 async for msg in ws:
@@ -851,8 +860,8 @@ class TibberLocalBridge:
 
                     # do we need to push new data event to the coordinator?
                     if new_data_arrived:
-                        await self.updated_tibber_metrics_if_needed()
                         self._ws_notify_for_new_data()
+                        self._ws_schedule_metrics_update()
 
         except ClientResponseError as cre:
             if hasattr(cre, "status") and cre.status == 404:
@@ -907,6 +916,7 @@ class TibberLocalBridge:
             #     return
 
             self.ws_connected = True
+            self._ws_LAST_UPDATE = time.time()
             _LOGGER.debug(f"ws_connect_2026_09(): connected to websocket: {self.url_ws} in COM MODE: {self._com_mode}")
 
             # our data container
@@ -972,16 +982,21 @@ class TibberLocalBridge:
         except Exception as ex:
             _LOGGER.warning(f"ws_connect_2026_09(): Error parsing WebSocket stream: {type(ex).__name__}: {ex}")
         finally:
-            if self.ws_writer is writer:
+            owns_stream = self.ws_writer is writer
+            if owns_stream:
                 self.ws_connected = False
                 self.ws_writer = None
                 self.ws_reader = None
-            if writer is not None:
-                try:
-                    writer.close()
-                    await writer.wait_closed()
-                except OSError:
-                    pass
+            try:
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except OSError:
+                        pass
+            finally:
+                if owns_stream:
+                    await self._ws_cancel_metrics_update()
 
     async def handle_buffer(self, buffer):
         self._ws_LAST_UPDATE = time.time()
@@ -992,10 +1007,34 @@ class TibberLocalBridge:
             _LOGGER.debug(f"ws_connect_2026_09(): Could not read {buffer} - caused {type(e).__name__} {e}")
 
         if new_data_arrived:
-            await self.updated_tibber_metrics_if_needed()
             self._ws_notify_for_new_data()
+            self._ws_schedule_metrics_update()
+
+    def _ws_schedule_metrics_update(self):
+        if self._coordinator is not None and self._coordinator._stopped:
+            return
+        if self._LAST_METRICS_UPDATE + 1800 > time.time():
+            return
+        if self._ws_metrics_task is None or self._ws_metrics_task.done():
+            if self._coordinator is not None:
+                self._ws_metrics_task = self._coordinator._config_entry.async_create_background_task(
+                    self._coordinator.hass, self.updated_tibber_metrics_if_needed(), "tibber_metrics")
+            else:
+                self._ws_metrics_task = asyncio.create_task(self.updated_tibber_metrics_if_needed())
+
+    async def _ws_cancel_metrics_update(self):
+        task = self._ws_metrics_task
+        self._ws_metrics_task = None
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     def _ws_notify_for_new_data(self):
+        if self._coordinator is not None:
+            if self._coordinator._stopped:
+                return
+            self._coordinator._schedule_meter_timeout()
         if self._ws_debounced_update_task is not None and not self._ws_debounced_update_task.done():
             # an already scheduled task will pick up the latest data by itself...
             # so there is no need to cancel it
@@ -1016,6 +1055,11 @@ class TibberLocalBridge:
 
             if _LOGGER.isEnabledFor(logging.DEBUG):
                 _LOGGER.debug(f"{self.url_ws} received: {gen_log_list(self._obis_values)}")
+            if self._coordinator._stopped:
+                return
+            if time.monotonic() - self._last_meter_data_update >= self._coordinator._meter_max_age:
+                self._coordinator._meter_data_expired(None)
+                return
             self._coordinator.async_set_updated_data({
                 OBIS_DATA_KEY: self._obis_values,
                 METRICS_KEY: self._metrics_data
@@ -1024,6 +1068,7 @@ class TibberLocalBridge:
 
     async def ws_close(self, ws):
         """Close the WebSocket connection cleanly."""
+        await self._ws_cancel_metrics_update()
         _LOGGER.debug(f"ws_close(): called")
         self.ws_connected = False
         if ws is not None:
@@ -1046,6 +1091,7 @@ class TibberLocalBridge:
 
     async def ws_close_and_prepare_to_terminate(self):
         try:
+            await self._ws_cancel_metrics_update()
             # a possibly scheduled coordinator update is not required any longer
             if self._ws_debounced_update_task is not None and not self._ws_debounced_update_task.done():
                 self._ws_debounced_update_task.cancel()

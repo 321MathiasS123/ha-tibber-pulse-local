@@ -13,10 +13,11 @@ from homeassistant.const import (
     CONF_MODE,
     CONF_DEVICE_ID,
     EVENT_HOMEASSISTANT_STARTED,
+    EVENT_HOMEASSISTANT_STOP,
     Platform,
     EntityCategory,
 )
-from homeassistant.core import HomeAssistant, CoreState
+from homeassistant.core import HomeAssistant, CoreState, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import entity_registry, device_registry as device_reg
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -194,7 +195,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
             if hass.state is CoreState.running:
                 await coordinator.start_watchdog()
             else:
-                hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, coordinator.start_watchdog)
+                config_entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, coordinator.start_watchdog))
 
         config_entry.async_on_unload(config_entry.add_update_listener(entry_update_listener))
         _LOGGER.info(f"async_setup_entry(): integration setup complete for {config_entry.entry_id}")
@@ -206,8 +207,8 @@ async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry):
     if unload_ok:
         if DOMAIN in hass.data and config_entry.entry_id in hass.data[DOMAIN]:
             coordinator = hass.data[DOMAIN][config_entry.entry_id]
-            await coordinator.bridge.ws_close_and_prepare_to_terminate()
             coordinator.stop_watchdog()
+            await coordinator.bridge.ws_close_and_prepare_to_terminate()
             hass.data[DOMAIN].pop(config_entry.entry_id)
     return unload_ok
 
@@ -257,6 +258,8 @@ class TibberLocalDataUpdateCoordinator(DataUpdateCoordinator):
 
             self._watchdog = None
             self._a_task = None
+            self._meter_timeout_unsub = None
+            self._stopped = False
 
             self._use_websocket_in_config = not config_entry.data.get(CONF_USE_POLLING, DEFAULT_USE_POLLING)
             self._device_info = None
@@ -268,7 +271,11 @@ class TibberLocalDataUpdateCoordinator(DataUpdateCoordinator):
             # fw is active
             self._use_classic = True
             self._integration_update_interval_in_seconds = config_entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-            super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=timedelta(seconds=self._integration_update_interval_in_seconds))
+            self._meter_max_age = 2 * self._integration_update_interval_in_seconds
+            update_interval = None if self._use_websocket_in_config else timedelta(seconds=self._integration_update_interval_in_seconds)
+            super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=update_interval)
+            config_entry.async_on_unload(self.stop_watchdog)
+            config_entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self.stop_watchdog))
 
     async def call_later_update_device_registry(self, now:Any):
         if not self._update_device_registry_is_running:
@@ -326,14 +333,51 @@ class TibberLocalDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def start_watchdog(self, event=None):
         """Start websocket watchdog."""
+        self._stopped = False
+        self._schedule_meter_timeout()
         await self._async_watchdog_check()
-        self._watchdog = async_track_time_interval(self.hass, self._async_watchdog_check, WEBSOCKET_WATCHDOG_INTERVAL)
+        if self.bridge.ws_supported:
+            self._watchdog = async_track_time_interval(self.hass, self._async_watchdog_check, WEBSOCKET_WATCHDOG_INTERVAL)
 
-    def stop_watchdog(self):
+    @callback
+    def stop_watchdog(self, event=None):
+        self._stopped = True
+        self._cancel_meter_timeout()
         if hasattr(self, "_watchdog") and self._watchdog is not None:
             self._watchdog()
             self._watchdog = None
             async_call_later(self.hass, 5, self.call_later_update_device_registry)
+
+    def _cancel_meter_timeout(self):
+        if self._meter_timeout_unsub is not None:
+            self._meter_timeout_unsub()
+            self._meter_timeout_unsub = None
+
+    def _schedule_meter_timeout(self):
+        self._cancel_meter_timeout()
+        if self._stopped or not self._use_websocket_in_config or not self.bridge.ws_supported:
+            return
+        remaining = self._meter_max_age - (time.monotonic() - self.bridge._last_meter_data_update)
+        self._meter_timeout_unsub = async_call_later(self.hass, max(0, remaining), self._meter_data_expired)
+
+    @callback
+    def _meter_data_expired(self, now):
+        self._cancel_meter_timeout()
+        if self._stopped or not self._use_websocket_in_config or not self.bridge.ws_supported:
+            return
+        if time.monotonic() - self.bridge._last_meter_data_update < self._meter_max_age:
+            self._schedule_meter_timeout()
+            return
+        if self.last_update_success:
+            self.async_set_update_error(UpdateFailed("No fresh meter data within the configured freshness window"))
+
+    async def async_request_refresh(self):
+        if not self._use_websocket_in_config or not self.bridge.ws_supported:
+            await super().async_request_refresh()
+
+    async def async_refresh(self):
+        if not self._use_websocket_in_config or not self.bridge.ws_supported:
+            await super().async_refresh()
 
     def _check_for_ws_task_and_cancel_if_running(self):
         if self._a_task is not None and not self._a_task.done():
@@ -347,8 +391,12 @@ class TibberLocalDataUpdateCoordinator(DataUpdateCoordinator):
     async def _async_watchdog_check(self, *_):
         """Reconnect the websocket if it fails."""
         if not self.bridge.ws_supported:
+            if self._a_task is not None and not self._a_task.done():
+                return
             _LOGGER.info(f"_async_watchdog_check(): Watchdog: terminated, cause bridge reported 'ws_supported' = false")
             self.stop_watchdog()
+            self.update_interval = timedelta(seconds=self._integration_update_interval_in_seconds)
+            await self.async_request_refresh()
         else:
             if not self.bridge.ws_connected:
                 if self._a_task is not None and not self._a_task.done():
@@ -403,6 +451,7 @@ class TibberLocalDataUpdateCoordinator(DataUpdateCoordinator):
                     OBIS_DATA_KEY: self.bridge._obis_values,
                     METRICS_KEY: self.bridge._metrics_data
                 })
+                self._schedule_meter_timeout()
 
             except BaseException as exception:
                 _LOGGER.warning(f"init_on_load(): caused {type(exception).__name__} - {exception}")
@@ -419,14 +468,11 @@ class TibberLocalDataUpdateCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self):
         update_started = time.monotonic()
         try:
-            if not self._use_classic:
-                if (not self._use_websocket_in_config
-                        or self.bridge._last_meter_data_update + self._integration_update_interval_in_seconds < time.monotonic()):
-                    # right now with new FW the websocket is not deliver any data - must check later how to solve this...
-                    _LOGGER.debug(f"_async_update_data(): called - new FW active websocket does not provide any data")
-                    await self.bridge.update()
-                else:
-                    _LOGGER.debug(f"_async_update_data(): called - (but websocket is active - and data read is active)")
+            if self._use_websocket_in_config and self.bridge.ws_supported:
+                # Supported push is delivered only by accepted frames, not refresh calls.
+                pass
+            elif not self._use_classic:
+                await self.bridge.update()
             else:
                 # the old FW implementation from here...
                 if self.bridge.ws_connected:

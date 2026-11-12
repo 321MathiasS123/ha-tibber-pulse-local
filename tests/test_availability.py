@@ -93,7 +93,7 @@ def make_bridge(client, response, mode=99):
     return b
 
 
-def coordinator(b, classic=False, polling=False):
+def coordinator(b, classic=False, polling=True):
     return SimpleNamespace(
         bridge=b, _use_classic=classic, _use_websocket_in_config=not polling,
         _integration_update_interval_in_seconds=3,
@@ -160,7 +160,7 @@ def test_failed_http_still_rejects_stale_or_unvalidated_data(client, clock, upda
 
 
 @pytest.mark.parametrize("traffic", ["fresh", "polling", "invalid_notification"])
-def test_fallback_uses_valid_meter_freshness_and_respects_polling(client, clock, update_method, traffic):
+def test_supported_push_does_not_poll_for_missing_notifications(client, clock, update_method, traffic):
     async def scenario():
         b = bridge(client, mode=99)
         clock.now = 90 if traffic == "invalid_notification" else 99.5
@@ -170,10 +170,10 @@ def test_fallback_uses_valid_meter_freshness_and_respects_polling(client, clock,
         clock.now = 101
         result = await update_method(coordinator(b, polling=traffic == "polling"))
         assert result[client.OBIS_DATA_KEY] is b._obis_values
-        if traffic == "fresh":
-            b.update.assert_not_awaited()
-        else:
+        if traffic == "polling":
             b.update.assert_awaited_once()
+        else:
+            b.update.assert_not_awaited()
     asyncio.run(scenario())
 
 
@@ -183,6 +183,8 @@ def test_classic_and_polling_transport_failures_remain_failures(client, clock, u
         response = PendingHTTP(error=aiohttp.ClientConnectionError())
         response.release.set()
         b = make_bridge(client, response)
+        if classic and not polling:
+            b.ws_supported = False
         await publish(b, 42)
         clock.now = 100
         with pytest.raises(UpdateFailed):
