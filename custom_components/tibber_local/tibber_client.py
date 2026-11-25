@@ -217,6 +217,7 @@ class TibberLocalBridge:
         self._metrics_update_is_running = False
         self._LAST_METRICS_UPDATE = 0
         self._metrics_data = {}
+        self._nodes_data = {}
         self._obis_values = {}
         self._last_meter_data_update = 0
         #self._obis_values_by_short = {}
@@ -307,6 +308,9 @@ class TibberLocalBridge:
                             if int(a_node_obj.get("node_id", -1)) == self.node_number:
                                 _LOGGER.debug(f"get_eui_for_node(): {a_node_obj} has the 'node_id' matching the one we are looking for: {self.node_number}")
                                 self.node_device_id = a_eui
+
+                                # storing the values for later use...
+                                self._nodes_data = a_node_obj
 
                 except Exception as exc:
                     if res.status == 401:
@@ -661,6 +665,21 @@ class TibberLocalBridge:
             # requested with every update cycle
             self._LAST_METRICS_UPDATE = time.time()
             self._metrics_update_is_running = False
+
+    async def updated_tibber_nodes_if_needed(self, log_payload: bool = False):
+        # The diagnostics coordinator owns the interval, serialization and failures.
+        async with self.web_session.get(self.url_metadata, headers=self.REQ_HEADERS_BASIC_AUTH, ssl=False, timeout=10.0) as res:
+            res.raise_for_status()
+            nodes = await res.json()
+        if not isinstance(nodes, list):
+            raise ValueError("Invalid bridge nodes response")
+        for node in nodes:
+            if isinstance(node, dict) and node.get("eui") == self.node_device_id and self.node_device_id:
+                self._nodes_data = node
+                if log_payload:
+                    _LOGGER.debug("updated_tibber_nodes_if_needed(): nodes response: %s", self._nodes_data)
+                return
+        raise ValueError("Configured Pulse missing from bridge nodes response")
 
     async def _ws_handle_binary_message(self, binary_data) -> bool:
         if not isinstance(binary_data, (bytes, bytearray)) or len(binary_data) == 0:

@@ -45,6 +45,7 @@ from .const import (
     CONFIG_MINOR_VERSION,
 
     OBIS_DATA_KEY,
+    NODES_KEY,
     METRICS_KEY,
     NODE_METRICS_CLASSIC,
     NODE_METRIC_PREFIX,
@@ -57,14 +58,17 @@ from .const import (
     NODE_METRICS_2026_09,
     IR_METRICS_2026_09,
     HUB_METRICS_2026_09,
-    CLASSIC_HUB_METRIC_MAP
+    CLASSIC_HUB_METRIC_MAP,
+    BATTERY_MIN_VOLTS,
+    BATTERY_MAX_VOLTS,
+    BATTERY_LEVEL_ESTIMATED
 )
 from .entity import CustomFriendlyNameEntity
 from .tibber_client import TibberLocalBridge
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: Final = [Platform.SENSOR]
+PLATFORMS: Final = [Platform.BINARY_SENSOR, Platform.SENSOR]
 WEBSOCKET_WATCHDOG_INTERVAL: Final = timedelta(seconds=10)
 MASKED_KEYS: Final = ("host", "password")
 
@@ -188,6 +192,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
         raise ConfigEntryNotReady
     else:
         hass.data[DOMAIN][config_entry.entry_id] = coordinator
+        # Diagnostics must remain observable when the meter stream is silent.
+        await coordinator.nodes_coordinator.async_refresh()
         await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
 
         if use_websocket:
@@ -274,8 +280,16 @@ class TibberLocalDataUpdateCoordinator(DataUpdateCoordinator):
             self._meter_max_age = 2 * self._integration_update_interval_in_seconds
             update_interval = None if self._use_websocket_in_config else timedelta(seconds=self._integration_update_interval_in_seconds)
             super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=update_interval)
+            self.nodes_coordinator = DataUpdateCoordinator(
+                hass, _LOGGER, config_entry=config_entry, name=f"{DOMAIN}_nodes",
+                update_interval=timedelta(seconds=120), update_method=self._async_update_nodes,
+            )
             config_entry.async_on_unload(self.stop_watchdog)
             config_entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self.stop_watchdog))
+
+    async def _async_update_nodes(self):
+        await self.bridge.updated_tibber_nodes_if_needed()
+        return {NODES_KEY: self.bridge._nodes_data}
 
     async def call_later_update_device_registry(self, now:Any):
         if not self._update_device_registry_is_running:
@@ -559,6 +573,16 @@ class TibberLocalDataUpdateCoordinator(DataUpdateCoordinator):
         else:
             return UNKNOWN_SERIAL
 
+    def _get_node_value_internal(self, sensor_key: str):
+        if self.nodes_coordinator.data is None:
+            return None
+        # getting the data...
+        meta_dict = self.nodes_coordinator.data.get(NODES_KEY, {})
+        if meta_dict is not None and len(meta_dict) > 0:
+            if sensor_key in meta_dict:
+                return meta_dict[sensor_key]
+        return None
+
     def _get_metric_value_internal(self, sensor_key: str):
         if self.data is None:
             return None
@@ -630,8 +654,18 @@ class TibberLocalDataUpdateCoordinator(DataUpdateCoordinator):
         if tag is None:
             return None
 
+        if tag.section == NODES_KEY:
+            return self._get_node_value_internal(tag.key)
+
         if tag.section == METRICS_KEY:
-            return self._get_metric_value_internal(tag.key)
+            if tag.key == BATTERY_LEVEL_ESTIMATED:
+                # special handling for self-calculated battery level ESTIMATE
+                bat_volts = self._get_metric_value_internal("node_battery_voltage")
+                if bat_volts and isinstance(bat_volts, Number):
+                    ratio = (bat_volts - BATTERY_MIN_VOLTS) / (BATTERY_MAX_VOLTS - BATTERY_MIN_VOLTS)
+                    return round(max(0.0, min(1.0, ratio)) * 100)
+            else:
+                return self._get_metric_value_internal(tag.key)
 
         if tag.section == OBIS_DATA_KEY:
             obis_candidates = [tag.key]
@@ -654,7 +688,8 @@ class TibberLocalEntity(CustomFriendlyNameEntity):
     def __init__(
             self, coordinator: TibberLocalDataUpdateCoordinator, description: EntityDescription
     ) -> None:
-        super().__init__(coordinator)
+        self._tibber_coordinator = coordinator
+        super().__init__(coordinator.nodes_coordinator if description.tag.section == NODES_KEY else coordinator)
         if description.entity_category != EntityCategory.DIAGNOSTIC:
             self.obis = ObisCode(description.key)
         self.entity_description = description
@@ -663,20 +698,30 @@ class TibberLocalEntity(CustomFriendlyNameEntity):
     @property
     def device_info(self) -> dict:
         # "hw_version": self.coordinator._config_entry.data.get(CONF_DEV_NAME, self.coordinator._config_entry.data.get(CONF_DEV_NAME)),
-        return self.coordinator.get_device_info()
+        return self._tibber_coordinator.get_device_info()
 
     @property
     def available(self):
-        """Return True if entity is available."""
-        return self.coordinator.last_update_success and self.coordinator.data is not None and len(self.coordinator.data) > 0
+        super_val = self.coordinator.last_update_success and self.coordinator.data is not None and len(self.coordinator.data) > 0
+        if super_val:
+            if self.entity_description.tag.section == OBIS_DATA_KEY and len(self.coordinator.data.get(OBIS_DATA_KEY, {})) == 0:
+                return False
+
+            if self.entity_description.tag.section == NODES_KEY and len(self.coordinator.data.get(NODES_KEY, {})) == 0:
+                return False
+
+            if self.entity_description.tag.section == METRICS_KEY and len(self.coordinator.data.get(METRICS_KEY, {})) == 0:
+                return False
+
+        return super_val
 
     @property
     def unique_id(self):
         """Return a unique ID to use for this entity."""
-        if self.coordinator.use_conf_entry_title_in_ids:
-            return f"{DOMAIN}.{self.coordinator.config_entry.title}_{self.entity_description.key}".lower()
+        if self._tibber_coordinator.use_conf_entry_title_in_ids:
+            return f"{DOMAIN}.{self._tibber_coordinator.config_entry.title}_{self.entity_description.key}".lower()
         else:
-            return f"tibber_local_uid_{self.coordinator.device_id}_{self.entity_description.key}".lower()
+            return f"tibber_local_uid_{self._tibber_coordinator.device_id}_{self.entity_description.key}".lower()
 
     def _friendly_name_internal(self) -> str | None:
         """Return the friendly name.

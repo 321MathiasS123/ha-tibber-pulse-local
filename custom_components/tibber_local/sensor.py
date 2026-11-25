@@ -14,6 +14,7 @@ from .const import (
     SENSOR_TYPES,
     DEFAULT_OBIS_CODES,
     OBIS_DATA_KEY,
+    NODES_KEY,
     METRICS_KEY,
 )
 
@@ -44,7 +45,9 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
             continue
 
         should_add = False
-        if description.tag.section == METRICS_KEY:
+        if description.tag.section == NODES_KEY:
+            should_add = True
+        elif description.tag.section == METRICS_KEY:
             should_add = bool(metrics_values)
         elif description.tag.section == OBIS_DATA_KEY:
             keys_to_check = [description.tag.key]
@@ -68,7 +71,7 @@ class TibberLocalSensor(TibberLocalEntity, SensorEntity):
         super().__init__(coordinator=coordinator, description=description)
 
         key = self.entity_description.key.lower()
-        self.entity_id = f"{Platform.SENSOR}.{slugify(self.coordinator._config_entry.title)}_{key}".lower()
+        self.entity_id = f"{Platform.SENSOR}.{slugify(coordinator._config_entry.title)}_{key}".lower()
 
         # we use the "key" also as our internal translation-key - and EXTREMELY important we have
         self._attr_translation_key = key
@@ -81,17 +84,5 @@ class TibberLocalSensor(TibberLocalEntity, SensorEntity):
     @property
     def native_value(self) -> StateType:
         if self.coordinator.data is not None:
-            return self.coordinator.get_sensor_value(self.entity_description.tag)
+            return self._tibber_coordinator.get_sensor_value(self.entity_description.tag)
         return None
-
-    @property
-    def available(self):
-        super_val = super().available
-        if super_val:
-            if self.entity_description.tag.section == OBIS_DATA_KEY and len(self.coordinator.data.get(OBIS_DATA_KEY, {})) == 0:
-                return False
-
-            if self.entity_description.tag.section == METRICS_KEY and len(self.coordinator.data.get(METRICS_KEY, {})) == 0:
-                return False
-
-        return super_val

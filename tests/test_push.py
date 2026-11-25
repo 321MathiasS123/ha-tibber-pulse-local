@@ -34,8 +34,9 @@ def push_setup(client, monkeypatch):
         return row.cancel
 
     class BaseCoordinator:
-        def __init__(self, hass, logger, name, update_interval=None):
+        def __init__(self, hass, logger, name, update_interval=None, config_entry=None, update_method=None):
             self.hass, self.update_interval = hass, update_interval
+            self.config_entry, self.update_method = config_entry, update_method
             self.data, self.last_update_success = None, True
             self.publications, self.errors, self.refreshes = [], [], 0
 
@@ -49,7 +50,12 @@ def push_setup(client, monkeypatch):
 
         async def async_refresh(self):
             self.refreshes += 1
-            self.async_set_updated_data(await self._async_update_data())
+            try:
+                data = await (self.update_method() if self.update_method else self._async_update_data())
+            except Exception as exc:
+                self.async_set_update_error(exc)
+            else:
+                self.async_set_updated_data(data)
 
         async def async_request_refresh(self):
             self.refreshes += 1
@@ -58,7 +64,7 @@ def push_setup(client, monkeypatch):
     selected = {
         "__init__", "init_on_load", "start_watchdog", "stop_watchdog", "_cancel_meter_timeout",
         "_schedule_meter_timeout", "_meter_data_expired", "async_request_refresh", "async_refresh",
-        "_check_for_ws_task_and_cancel_if_running", "_async_watchdog_check", "_async_update_data",
+        "_check_for_ws_task_and_cancel_if_running", "_async_watchdog_check", "_async_update_data", "_async_update_nodes",
     }
     tree = ast.parse((SOURCE / "__init__.py").read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef)
@@ -77,6 +83,7 @@ def push_setup(client, monkeypatch):
         "EVENT_HOMEASSISTANT_STOP": "stop", "EVENT_HOMEASSISTANT_STARTED": "started",
         "WEBSOCKET_WATCHDOG_INTERVAL": timedelta(seconds=10),
         "OBIS_DATA_KEY": client.OBIS_DATA_KEY, "METRICS_KEY": client.METRICS_KEY,
+        "NODES_KEY": "nodes",
         "UpdateFailed": type("UpdateFailed", (Exception,), {}),
         "TibberLocalBridge": client.TibberLocalBridge, "tibber_client": client,
         "async_get_clientsession": lambda hass: session, "async_call_later": later,
